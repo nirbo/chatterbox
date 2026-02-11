@@ -1,0 +1,20 @@
+# Core (installed via `pip install -e .` from repo root)
+# chatterbox-tts
+
+# Training
+peft>=0.14.0
+accelerate>=1.2.0
+
+# Data preparation
+whisperx
+librosa>=0.11.0
+soundfile
+
+# Logging (optional)
+wandb
+
+# Already in chatterbox deps but listed for clarity
+torch>=2.6.0
+torchaudio>=2.6.0
+transformers>=4.46.3
+safetensors>=0.5.3
