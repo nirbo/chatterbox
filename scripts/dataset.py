@@ -33,10 +33,24 @@ class ChatterboxT3Dataset(Dataset):
     def __getitem__(self, idx):
         data = torch.load(self.files[idx], weights_only=True)
 
-        text_tokens = data["text_tokens"][:self.max_text_len]
-        speech_tokens = data["speech_tokens"][:self.max_speech_len]
+        # Truncate before wrapping so max_len accounts for special tokens
+        text_tokens = data["text_tokens"][:self.max_text_len - 2]
+        speech_tokens = data["speech_tokens"][:self.max_speech_len - 1]
         speaker_emb = data["speaker_emb"]       # (1, 256)
         cond_tokens = data["cond_tokens"]        # (375,)
+
+        # Wrap text with BOT (255) and EOT (0) — required by T3._ensure_BOT_EOT
+        text_tokens = torch.cat([
+            torch.tensor([BOT_TOKEN], dtype=torch.long),
+            text_tokens,
+            torch.tensor([EOT_TOKEN], dtype=torch.long),
+        ])
+
+        # Prepend start_speech (6561) — stop_speech (6562) already appended by preprocessing
+        speech_tokens = torch.cat([
+            torch.tensor([START_SPEECH_TOKEN], dtype=torch.long),
+            speech_tokens,
+        ])
 
         return {
             "text_tokens": text_tokens,
@@ -46,10 +60,15 @@ class ChatterboxT3Dataset(Dataset):
         }
 
 
-# Turbo uses GPT-2 tokenizer, pad_token_id = eos_token_id = 50256
-TEXT_PAD_TOKEN = 50256
+# T3-internal special tokens (from T3Config)
+BOT_TOKEN = 255           # start_text_token: prepended to text
+EOT_TOKEN = 0             # stop_text_token: appended to text
+START_SPEECH_TOKEN = 6561 # prepended to speech
+STOP_SPEECH_TOKEN = 6562  # appended to speech (already done in preprocessing)
+
+# Padding tokens
+TEXT_PAD_TOKEN = 50256     # GPT-2 eos_token_id
 SPEECH_PAD_TOKEN = 0
-STOP_SPEECH_TOKEN = 6562
 
 
 def collate_fn(batch):

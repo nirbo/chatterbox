@@ -18,12 +18,15 @@ Requires: pip install peft accelerate wandb (wandb optional)
 
 import argparse
 import logging
+import time
 from pathlib import Path
 
 import torch
+import torch.nn.functional as F
 from torch.utils.data import DataLoader, random_split
 from peft import LoraConfig, get_peft_model
 from safetensors.torch import load_file
+from rich.console import Console
 
 from chatterbox.models.t3.t3 import T3
 from chatterbox.models.t3.modules.t3_config import T3Config
@@ -33,6 +36,61 @@ from dataset import ChatterboxT3Dataset, collate_fn
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
+console = Console()
+
+# Colorblind-friendly palette (dark-mode)
+C_EPOCH = "bold cyan"
+C_STEP = "bright_blue"
+C_SPEECH = "#FF9E64"       # warm orange
+C_TEXT = "#7AA2F7"          # soft blue
+C_LR = "#BB9AF7"            # lavender
+C_VAL = "#73DACA"           # teal
+C_SAVE = "#E0AF68"          # gold
+C_BEST = "#9ECE6A"          # lime green
+C_DIM = "dim"
+
+
+C_SPEED = "#F7768E"          # soft pink — tok/sec
+C_ETA = "#C0CAF5"            # pale slate — ETA
+
+
+def log_step(epoch, epochs, step, total_steps, speech_loss, text_loss, lr,
+             tok_per_sec=None, eta_str=None):
+    parts = (
+        f"  [{C_EPOCH}]E {epoch}/{epochs}[/]"
+        f"  [{C_STEP}]step {step}/{total_steps}[/]"
+        f"  [{C_SPEECH}]speech[/] [{C_DIM}]=[/][{C_SPEECH}]{speech_loss:.4f}[/]"
+        f"  [{C_TEXT}]text[/] [{C_DIM}]=[/][{C_TEXT}]{text_loss:.4f}[/]"
+        f"  [{C_LR}]lr[/] [{C_DIM}]=[/][{C_LR}]{lr:.6f}[/]"
+    )
+    if tok_per_sec is not None:
+        parts += f"  [{C_SPEED}]tok/s[/] [{C_DIM}]=[/][{C_SPEED}]{tok_per_sec:.0f}[/]"
+    if eta_str is not None:
+        parts += f"  [{C_ETA}]ETA[/] [{C_DIM}]=[/][{C_ETA}]{eta_str}[/]"
+    console.print(parts, highlight=False)
+
+
+def log_epoch_summary(epoch, kind, speech_loss, text_loss):
+    tag_color = C_VAL if kind == "val" else C_EPOCH
+    console.print(
+        f"  [{tag_color}]Epoch {epoch} {kind}[/]"
+        f"  [{C_SPEECH}]speech[/] [{C_DIM}]=[/][{C_SPEECH}]{speech_loss:.4f}[/]"
+        f"  [{C_TEXT}]text[/] [{C_DIM}]=[/][{C_TEXT}]{text_loss:.4f}[/]",
+        highlight=False,
+    )
+
+
+def log_save(msg):
+    console.print(f"  [{C_SAVE}]{msg}[/]", highlight=False)
+
+
+def log_best(val_loss, path):
+    console.print(
+        f"  [{C_BEST}]New best[/]"
+        f"  [{C_SPEECH}]val_speech[/] [{C_DIM}]=[/][{C_SPEECH}]{val_loss:.4f}[/]"
+        f"  [{C_DIM}]->[/] [{C_SAVE}]{path}[/]",
+        highlight=False,
+    )
 
 
 def build_t3_turbo(ckpt_dir: str, device: str) -> T3:
@@ -88,7 +146,8 @@ def build_t3_cond(batch: dict, device: str) -> T3Cond:
 def compute_loss(t3_model, batch: dict, device: str):
     """
     Forward pass through T3 and compute cross-entropy loss.
-    Uses T3's native loss() which handles concat + splice correctly.
+    Bypasses T3.loss() which has a shape bug in F.cross_entropy (passes B,T,C
+    but PyTorch expects B,C,T for 3D). We call forward() + reshape to 2D instead.
     """
     text_tokens = batch["text_tokens"].to(device)
     text_token_lens = batch["text_token_lens"].to(device)
@@ -97,15 +156,36 @@ def compute_loss(t3_model, batch: dict, device: str):
 
     t3_cond = build_t3_cond(batch, device)
 
-    # peft wraps the module; get the underlying T3 which has .loss()
-    base = t3_model.get_base_model() if hasattr(t3_model, "get_base_model") else t3_model
-
-    loss_text, loss_speech = base.loss(
+    # Call through the model wrapper (PeftModel / torch.compile) — not get_base_model()
+    # which would bypass the compile graph. PEFT forwards all kwargs to T3.forward().
+    out = t3_model(
         t3_cond=t3_cond,
         text_tokens=text_tokens,
         text_token_lens=text_token_lens,
         speech_tokens=speech_tokens,
         speech_token_lens=speech_token_lens,
+        training=True,
+    )
+
+    # Masking logic from T3.loss() (t3.py:214-219)
+    IGNORE_ID = -100
+    len_text = text_tokens.size(1)
+    len_speech = speech_tokens.size(1)
+    mask_text = torch.arange(len_text, device=device)[None] >= text_token_lens[:, None]
+    mask_speech = torch.arange(len_speech, device=device)[None] >= speech_token_lens[:, None]
+    masked_text = text_tokens.masked_fill(mask_text, IGNORE_ID)
+    masked_speech = speech_tokens.masked_fill(mask_speech, IGNORE_ID)
+
+    # Reshape to 2D: (B*T, C) logits + (B*T,) targets — avoids 3D shape ambiguity
+    loss_text = F.cross_entropy(
+        out.text_logits.reshape(-1, out.text_logits.size(-1)),
+        masked_text.reshape(-1),
+        ignore_index=IGNORE_ID,
+    )
+    loss_speech = F.cross_entropy(
+        out.speech_logits.reshape(-1, out.speech_logits.size(-1)),
+        masked_speech.reshape(-1),
+        ignore_index=IGNORE_ID,
     )
 
     # Speech loss is the primary objective; text loss is auxiliary
@@ -159,6 +239,9 @@ def main():
     parser.add_argument("--save_every_epoch", type=int, default=1)
     parser.add_argument("--val_split", type=float, default=0.05, help="Validation split if no val_dir")
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--compile", type=str, default=None, metavar="MODE",
+                        choices=["default", "reduce-overhead", "max-autotune", "max-autotune-no-cudagraphs"],
+                        help="torch.compile mode (omit to disable)")
     parser.add_argument("--wandb", action="store_true", help="Enable W&B logging")
     parser.add_argument("--wandb_project", type=str, default="chatterbox-pause-tags")
     args = parser.parse_args()
@@ -214,6 +297,10 @@ def main():
     logger.info("Applying LoRA...")
     t3_lora = apply_lora(t3, lora_r=args.lora_r, lora_alpha=args.lora_alpha, lora_dropout=args.lora_dropout)
 
+    if args.compile:
+        logger.info(f"Compiling model with mode={args.compile}...")
+        t3_lora = torch.compile(t3_lora, mode=args.compile, dynamic=True)
+
     # ── Optimizer ────────────────────────────────────────────────────────
     optimizer = torch.optim.AdamW(
         filter(lambda p: p.requires_grad, t3_lora.parameters()),
@@ -228,14 +315,20 @@ def main():
     logger.info("Starting training...")
     global_step = 0
     best_val_loss = float("inf")
+    total_train_steps = len(train_loader) * args.epochs
+    train_t0 = time.time()
 
     for epoch in range(args.epochs):
         t3_lora.train()
         epoch_speech_loss = 0.0
         epoch_text_loss = 0.0
         n_steps = 0
+        log_t0 = time.time()
+        log_tokens = 0
 
         for step, batch in enumerate(train_loader):
+            batch_tokens = int(batch["speech_token_lens"].sum()) + int(batch["text_token_lens"].sum())
+
             with torch.amp.autocast("cuda", dtype=torch.bfloat16):
                 total_loss, speech_loss, text_loss = compute_loss(t3_lora, batch, args.device)
                 scaled_loss = total_loss / args.grad_accum
@@ -254,30 +347,46 @@ def main():
             epoch_speech_loss += speech_loss
             epoch_text_loss += text_loss
             n_steps += 1
+            log_tokens += batch_tokens
 
             if step % args.log_every == 0:
                 lr = optimizer.param_groups[0]["lr"]
-                logger.info(
-                    f"[Epoch {epoch+1}/{args.epochs}][Step {step}/{len(train_loader)}] "
-                    f"speech_loss={speech_loss:.4f} text_loss={text_loss:.4f} lr={lr:.2e}"
-                )
+                # Throughput
+                now = time.time()
+                dt = now - log_t0
+                tok_per_sec = log_tokens / dt if dt > 0 else 0
+                # ETA
+                done_steps = epoch * len(train_loader) + step + 1
+                elapsed = now - train_t0
+                steps_per_sec = done_steps / elapsed if elapsed > 0 else 1
+                remaining = (total_train_steps - done_steps) / steps_per_sec
+                h, m = divmod(int(remaining), 3600)
+                m, s = divmod(m, 60)
+                eta_str = f"{h}h{m:02d}m" if h else f"{m}m{s:02d}s"
+                # Reset per-window counters
+                log_t0 = now
+                log_tokens = 0
+
+                log_step(epoch + 1, args.epochs, step, len(train_loader),
+                         speech_loss, text_loss, lr, tok_per_sec, eta_str)
                 if args.wandb:
                     wandb.log({
                         "train/speech_loss": speech_loss,
                         "train/text_loss": text_loss,
                         "train/total_loss": total_loss.item(),
                         "train/lr": lr,
+                        "train/tok_per_sec": tok_per_sec,
                         "global_step": global_step,
                     })
 
         # ── Epoch summary ────────────────────────────────────────────────
         avg_speech = epoch_speech_loss / max(n_steps, 1)
         avg_text = epoch_text_loss / max(n_steps, 1)
-        logger.info(f"Epoch {epoch+1} train avg: speech_loss={avg_speech:.4f} text_loss={avg_text:.4f}")
+        log_epoch_summary(epoch + 1, "train", avg_speech, avg_text)
 
         # ── Validation ───────────────────────────────────────────────────
         val_speech, val_text = validate(t3_lora, val_loader, args.device)
-        logger.info(f"Epoch {epoch+1} val: speech_loss={val_speech:.4f} text_loss={val_text:.4f}")
+        log_epoch_summary(epoch + 1, "val", val_speech, val_text)
 
         if args.wandb:
             wandb.log({
@@ -290,15 +399,16 @@ def main():
         if (epoch + 1) % args.save_every_epoch == 0:
             save_path = output_dir / f"epoch_{epoch+1}"
             t3_lora.save_pretrained(save_path)
-            logger.info(f"Saved LoRA checkpoint: {save_path}")
+            log_save(f"Saved LoRA checkpoint: {save_path}")
 
         if val_speech < best_val_loss:
             best_val_loss = val_speech
             best_path = output_dir / "best"
             t3_lora.save_pretrained(best_path)
-            logger.info(f"New best model (val_speech_loss={val_speech:.4f}): {best_path}")
+            log_best(val_speech, best_path)
 
-    logger.info(f"Training complete. Best val speech loss: {best_val_loss:.4f}")
+    console.print(f"  [{C_BEST}]Training complete. Best val speech loss: {best_val_loss:.4f}[/]",
+                  highlight=False)
 
     if args.wandb:
         wandb.finish()

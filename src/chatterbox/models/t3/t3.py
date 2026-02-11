@@ -123,11 +123,8 @@ class T3(nn.Module):
         if cond_emb.size(0) != text_emb.size(0):
              cond_emb = cond_emb.expand(text_emb.size(0), -1, -1)
 
-        # concat
-        embeds = torch.stack([
-            torch.cat((ce, te, se))
-            for ce, te, se in zip(cond_emb, text_emb, speech_emb)
-        ])  # (B, length, dim)
+        # concat along sequence dim (all samples share padded lengths within a batch)
+        embeds = torch.cat([cond_emb, text_emb, speech_emb], dim=1)  # (B, length, dim)
         return embeds, len_cond
 
     def forward(
@@ -163,17 +160,18 @@ class T3(nn.Module):
         # post-processing: splice out text and speech parts of hidden states
         len_text = text_tokens.size(1)
         len_speech = speech_tokens.size(1)
-        B, _, dim = hidden_states.shape
-        device, dtype = hidden_states.device, hidden_states.dtype
-        text_latents = torch.zeros(B, len_text, dim, dtype=dtype, device=device)
-        speech_latents = torch.zeros(B, len_speech, dim, dtype=dtype, device=device)
-        ttl, stl = text_token_lens, speech_token_lens
-        for i in range(B):
-            text_end = len_cond + ttl[i].item()
-            speech_start = len_cond + text_tokens.size(1)
-            speech_end = speech_start + stl[i].item()
-            text_latents[i, :ttl[i]] = hidden_states[i, len_cond:text_end]
-            speech_latents[i, :stl[i]] = hidden_states[i, speech_start:speech_end]
+        speech_start = len_cond + len_text
+
+        # Slice full padded regions (no per-sample loop)
+        text_latents = hidden_states[:, len_cond:len_cond + len_text]        # (B, len_text, dim)
+        speech_latents = hidden_states[:, speech_start:speech_start + len_speech]  # (B, len_speech, dim)
+
+        # Zero out padding positions via length masks
+        device = hidden_states.device
+        text_mask = (torch.arange(len_text, device=device)[None, :] < text_token_lens[:, None]).unsqueeze(-1)
+        speech_mask = (torch.arange(len_speech, device=device)[None, :] < speech_token_lens[:, None]).unsqueeze(-1)
+        text_latents = text_latents * text_mask
+        speech_latents = speech_latents * speech_mask
 
         # logit projection
         text_logits = self.text_head(text_latents)

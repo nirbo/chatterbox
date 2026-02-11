@@ -46,245 +46,260 @@ will work the same way.
 
 ---
 
-## 2. The Training Approach
+## 2. Training Strategy
 
 ### What Exactly Happens
 
 1. **Input**: Text with pause tags + reference audio (for speaker conditioning)
-2. **Target**: Speech tokens where pause regions are replaced with silence token runs
-3. **Loss**: Cross-entropy on predicted speech tokens (same as original training)
+2. **Target**: Speech tokens where pause regions contain silence token runs
+3. **Loss**: `loss_speech + 0.1 * loss_text` (cross-entropy on predicted tokens)
 
-The `T3.loss()` method at `src/chatterbox/models/t3/t3.py:190` already implements this:
-```python
-def loss(self, *, t3_cond, text_tokens, text_token_lens, speech_tokens, speech_token_lens):
-    out = self.forward(t3_cond=..., text_tokens=..., speech_tokens=..., training=True)
-    loss_text = F.cross_entropy(out.text_logits, masked_text, ignore_index=-100)
-    loss_speech = F.cross_entropy(out.speech_logits, masked_speech, ignore_index=-100)
-    return loss_text, loss_speech
-```
+### LoRA Fine-Tune
 
-### Strategy: LoRA Fine-Tune (Recommended)
+Full fine-tune of 350M params risks catastrophic forgetting. Use LoRA on
+the attention layers of the GPT-2 backbone:
 
-Full fine-tune of 350M params is overkill and risks catastrophic forgetting. Use LoRA on
-the attention layers of the GPT-2 backbone. This keeps 99%+ of params frozen and trains
-~2-4M new parameters.
+- **Target modules**: `c_attn`, `c_proj` (GPT-2 attention projections)
+- **Rank**: r=16, alpha=32, dropout=0.05
+- **Trainable params**: ~2-4M (vs 350M total)
 
 ---
 
 ## 3. Environment Setup
 
-### 3.1 System Requirements
+### Hardware Requirements
 
-- **GPU**: RTX 5090 32GB (Blackwell SM120) -- more than enough
-- **CUDA**: 12.8+ (for Blackwell/SM120 support)
+- **GPU**: 24+ GB VRAM (tested on RTX 5090 32GB, Blackwell SM120)
+- **CUDA**: 12.8+ for Blackwell, 12.1+ for Ampere/Hopper
+- **Disk**: ~50GB for dataset + checkpoints
 - **Python**: 3.11+
-- **Disk**: ~50GB for datasets, checkpoints, and logs
 
-### 3.2 Install Dependencies
+### Install Dependencies
 
 ```bash
-# Clone and install chatterbox in editable mode
-cd /home/nir/ml-tools/chatterbox
+cd /path/to/chatterbox
+python -m venv venv
+source venv/bin/activate
+
+# Install chatterbox in editable mode
 pip install -e .
 
-# Training dependencies (not included in chatterbox)
-pip install peft>=0.14.0          # LoRA / parameter-efficient fine-tuning
-pip install accelerate>=1.2.0     # Mixed-precision, gradient accumulation
-pip install wandb                 # Experiment tracking (optional but recommended)
-pip install datasets              # HuggingFace datasets (optional)
-pip install webdataset            # For large-scale streaming datasets (optional)
+# Training dependencies
+pip install -r scripts/requirements-train.txt
 ```
 
-### 3.3 Verify CUDA + GPU
-
-```bash
-python -c "
-import torch
-print(f'CUDA available: {torch.cuda.is_available()}')
-print(f'GPU: {torch.cuda.get_device_name(0)}')
-print(f'VRAM: {torch.cuda.get_device_properties(0).total_mem / 1e9:.1f} GB')
-print(f'Compute capability: {torch.cuda.get_device_capability(0)}')
-print(f'PyTorch: {torch.__version__}')
-"
+**`scripts/requirements-train.txt`:**
+```
+peft>=0.14.0
+accelerate>=1.2.0
+whisperx
+librosa>=0.11.0
+soundfile
+wandb           # optional
+torch>=2.6.0
+torchaudio>=2.6.0
+transformers>=4.46.3
+safetensors>=0.5.3
 ```
 
-### 3.4 Download Pretrained Weights
+### Download Pretrained Weights
 
-```python
-from chatterbox.tts_turbo import ChatterboxTurboTTS
-# This downloads all components to HF cache
-model = ChatterboxTurboTTS.from_pretrained(device="cuda")
-```
-
-Or manually:
 ```bash
 huggingface-cli download ResembleAI/chatterbox-turbo --local-dir ./ckpts/turbo
 ```
 
----
-
-## 4. Dataset Preparation
-
-### 4.1 What You Need
-
-Each training sample consists of:
-
-| Field | Description |
-|-------|-------------|
-| `audio` | Waveform file (WAV, 16kHz mono preferred) |
-| `text` | Transcript **with** pause tags, e.g. `"Hello [0.5s] world."` |
-| `ref_audio` | Reference clip for speaker conditioning (5-15s, same speaker) |
-
-### 4.2 Option A: Synthesize Pause Data from Existing TTS Data
-
-If you have a clean TTS dataset (LJSpeech, LibriTTS, VCTK, your own):
-
-1. **Force-align** text to audio using MFA (Montreal Forced Aligner) or WhisperX
-2. **Identify natural pauses** (silences > 200ms between words)
-3. **Insert pause tags** in the transcript at those locations
-4. Optionally **augment** by splicing extra silence into existing audio and inserting
-   corresponding tags
-
+Or from Python:
 ```python
-"""
-Pseudocode: Generate training pairs from aligned data.
-"""
-import torchaudio
-from chatterbox.models.s3tokenizer import S3Tokenizer
-
-s3tok = S3Tokenizer()  # or load from pretrained
-
-def make_pause_sample(wav_path, alignment, tokenizer):
-    wav, sr = torchaudio.load(wav_path)
-    wav_16k = torchaudio.functional.resample(wav, sr, 16000)
-
-    # Get speech tokens for entire utterance
-    speech_tokens, _ = s3tok(wav_16k.unsqueeze(0).cuda())
-    speech_tokens = speech_tokens.squeeze(0)  # (T,)
-
-    text_with_tags = ""
-    for i, word_info in enumerate(alignment):
-        text_with_tags += word_info["word"]
-        if i < len(alignment) - 1:
-            gap = alignment[i+1]["start"] - word_info["end"]
-            if gap >= 0.2:  # 200ms+ gap
-                duration = round(gap, 1)
-                text_with_tags += f" [{duration}s]"
-        text_with_tags += " "
-
-    return {
-        "text": text_with_tags.strip(),
-        "speech_tokens": speech_tokens,  # already has silence in right places
-        "wav_16k": wav_16k,
-    }
+from chatterbox.tts_turbo import ChatterboxTurboTTS
+model = ChatterboxTurboTTS.from_pretrained(device="cuda")
 ```
-
-### 4.3 Option B: Splice Silence Directly into Speech Tokens
-
-For more control, directly manipulate speech token sequences:
-
-```python
-SIL_TOKEN = 4299
-TOKEN_RATE = 25  # tokens per second
-
-def insert_pause_tokens(speech_tokens, pause_position_tok, pause_duration_s):
-    """Insert silence tokens at a specific position in the speech token sequence."""
-    n_sil = round(pause_duration_s * TOKEN_RATE)
-    sil_block = torch.full((n_sil,), SIL_TOKEN, dtype=speech_tokens.dtype)
-    return torch.cat([
-        speech_tokens[:pause_position_tok],
-        sil_block,
-        speech_tokens[pause_position_tok:]
-    ])
-```
-
-### 4.4 Dataset Format (On Disk)
-
-Structure as a simple directory of JSON + WAV:
-
-```
-dataset/
-  manifests/
-    train.jsonl     # one JSON object per line
-    val.jsonl
-  wavs/
-    utt_0001.wav
-    utt_0002.wav
-    ...
-```
-
-Each line in `train.jsonl`:
-```json
-{
-  "id": "utt_0001",
-  "wav": "wavs/utt_0001.wav",
-  "text": "The quick brown fox [0.3s] jumped over the lazy dog.",
-  "ref_wav": "wavs/utt_0001.wav",
-  "speaker": "speaker_01"
-}
-```
-
-### 4.5 Data Volume Guidelines
-
-| Scenario | Data Needed | Expected Quality |
-|----------|-------------|-----------------|
-| Proof of concept | 100-500 samples | Learns the concept, timing rough |
-| Usable | 2,000-5,000 samples | Good timing, some drift |
-| Production | 10,000+ samples | Precise pause control |
-
-Mix 50/50 with samples **without** pause tags to avoid forgetting normal speech.
 
 ---
 
-## 5. Training Scripts
+## 4. Full Pipeline
 
-All scripts are in the `scripts/` directory. The pipeline has four stages:
+```
+Step 1: Download dataset    →  dataset/wavs/ + dataset/manifests/train_raw.jsonl
+Step 2: Generate pause data →  dataset/manifests/train.jsonl (with [Xs] tags)
+Step 3: Preprocess          →  dataset/preprocessed/train/*.pt
+Step 4: Train LoRA          →  output/pause_lora/best/
+Step 5: Inference           →  output.wav
+```
 
-### 5.1 Generate Pause-Tag Data
+---
+
+## 5. Scripts Reference
+
+### 5.1 `download_peoples_speech.py` — Download Dataset
+
+Streams People's Speech from HuggingFace, filters by duration, saves as WAV + JSONL manifest.
 
 ```bash
-# From LJSpeech-style dataset (uses WhisperX for forced alignment):
+python scripts/download_peoples_speech.py \
+    --n_samples 30000 \
+    --output_dir dataset \
+    --min_duration 2.0 \
+    --max_duration 20.0
+```
+
+**Output:**
+- `dataset/wavs/ps_000000.wav` ... `ps_029999.wav` (~13 GB)
+- `dataset/manifests/train_raw.jsonl`
+
+**Manifest format (one JSON per line):**
+```json
+{"id": "ps_000000", "wav": "wavs/ps_000000.wav", "text": "the actual transcript"}
+```
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--n_samples` | 30000 | Number of utterances to download |
+| `--output_dir` | dataset | Root output directory |
+| `--min_duration` | 2.0 | Min utterance duration (seconds) |
+| `--max_duration` | 20.0 | Max utterance duration (seconds) |
+| `--split` | train | HuggingFace dataset split |
+
+---
+
+### 5.2 `make_pause_data.py` — Generate Pause-Tagged Data
+
+Force-aligns text to audio using WhisperX (wav2vec2-based alignment, no ASR needed since
+transcripts already exist), identifies natural pauses between words, and inserts `[Xs]` tags.
+
+```bash
+python scripts/make_pause_data.py \
+    --input_manifest dataset/manifests/train_raw.jsonl \
+    --data_root dataset/ \
+    --format jsonl \
+    --output_manifest dataset/manifests/train.jsonl \
+    --output_wavs dataset/wavs \
+    --augment \
+    --workers 8 \
+    --device cuda
+```
+
+**Performance:** ~57 samples/s with 8 workers on RTX 5090 (30k input → 68,701 output in ~9 min).
+
+**How it works:**
+1. Each worker loads its own wav2vec2 alignment model (~360MB VRAM each)
+2. For each sample: load audio → force-align text → find word gaps ≥ 150ms → insert `[Xs]` tags
+3. Durations quantized to 0.25s steps (0.25, 0.5, 0.75 ... up to 3.0s)
+4. Augmentation (30% probability): splice 0.25-2.0s silence at random word boundaries
+5. Plain copies (no tags) included to preserve normal speech ability
+
+**Output:** `dataset/manifests/train.jsonl` with ~2.3x input samples:
+```json
+{"id": "ps_000000", "wav": "wavs/ps_000000.wav", "text": "Hello [0.5s] world.", "ref_wav": "wavs/ps_000000.wav"}
+{"id": "ps_000000_plain", "wav": "wavs/ps_000000.wav", "text": "Hello world.", "ref_wav": "wavs/ps_000000.wav"}
+{"id": "ps_000000_aug", "wav": "wavs/ps_000000_aug.wav", "text": "Hello [0.5s] world [1.0s] today.", "ref_wav": "wavs/ps_000000.wav"}
+```
+
+**Also works with LJSpeech format:**
+```bash
 python scripts/make_pause_data.py \
     --input_dir /path/to/LJSpeech-1.1 \
     --format ljspeech \
     --output_manifest dataset/manifests/train.jsonl \
     --output_wavs dataset/wavs \
-    --augment \
-    --device cuda
-
-# From existing JSONL manifest:
-python scripts/make_pause_data.py \
-    --input_manifest /path/to/manifest.jsonl \
-    --data_root /path/to/data \
-    --format jsonl \
-    --output_manifest dataset/manifests/train.jsonl \
-    --output_wavs dataset/wavs \
-    --augment \
-    --device cuda
+    --augment --workers 8
 ```
 
-See `scripts/make_pause_data.py` for details. It:
-- Force-aligns text to audio using WhisperX
-- Detects natural pauses (>150ms gaps between words)
-- Inserts `[Xs]` pause tags at those locations (quantized to 0.25s steps)
-- Optionally augments by splicing extra silence
-- Includes plain (no-tag) copies to prevent catastrophic forgetting
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--input_manifest` | - | Input JSONL manifest (for `--format jsonl`) |
+| `--input_dir` | - | LJSpeech directory (for `--format ljspeech`) |
+| `--data_root` | . | Root for resolving relative wav paths in JSONL |
+| `--format` | - | `jsonl` or `ljspeech` **(required)** |
+| `--output_manifest` | - | Output JSONL path **(required)** |
+| `--output_wavs` | - | Output WAV directory **(required)** |
+| `--device` | cuda | GPU device for alignment |
+| `--workers` | 8 | Worker processes (each loads own model, ~360MB VRAM each) |
+| `--augment` | false | Enable silence-splicing augmentation |
+| `--include_plain` | true | Include copies without pause tags |
+| `--skip_alignment` | false | Skip alignment entirely (pass text unchanged) |
+| `--seed` | 42 | Random seed for augmentation |
 
-### 5.2 Offline Preprocessing
+**PyTorch 2.6+ note:** Uses a `torch.load` monkeypatch for pyannote/whisperx compatibility
+with `weights_only=True` default. See `_patch_torch_load()` in the source.
+
+---
+
+### 5.3 `preprocess.py` — Tokenize (Batched GPU)
+
+Converts audio + text into pre-computed tensors for training. Runs S3 tokenizer, VoiceEncoder,
+and GPT-2 BPE in batched mode with threaded audio prefetching.
 
 ```bash
 python scripts/preprocess.py \
     --manifest dataset/manifests/train.jsonl \
     --data_root dataset/ \
     --output_dir dataset/preprocessed/train \
-    --ckpt_dir ./ckpts/turbo \
+    --batch_size 32 \
+    --num_workers 8 \
     --device cuda
 ```
 
-See `scripts/preprocess.py`. Produces `.pt` files with pre-computed speech tokens,
-speaker embeddings, and conditioning tokens. This avoids re-tokenizing audio every epoch.
+**Performance:** ~116 samples/s with batch_size=32 on RTX 5090 (68k samples in ~10 min, 2.9 GB output).
 
-### 5.3 Train
+**Optimizations over naive approach (3x-4x faster):**
+- Batched S3 tokenizer: 1 GPU call per batch for target audio AND conditioning audio
+- Batched VoiceEncoder: 1 call per batch for speaker embeddings
+- 8 threads prefetch audio (librosa load + resample) while GPU processes current batch
+- Resumable: skips samples where `{id}.pt` already exists
+
+**Output per sample** (`dataset/preprocessed/train/{id}.pt`):
+```python
+{
+    "id":            str,                          # "ps_000000"
+    "text":          str,                          # "Hello [0.5s] world."
+    "text_tokens":   LongTensor (T_text,),         # GPT-2 BPE token IDs
+    "speech_tokens": LongTensor (T_speech,),       # S3 VQ tokens + stop token (6562)
+    "speaker_emb":   FloatTensor (1, 256),         # VoiceEncoder speaker embedding
+    "cond_tokens":   LongTensor (375,),            # Conditioning speech tokens (from first 15s ref)
+}
+```
+
+**Typical speech token stats:** min=52, max=426, mean=355 (for 2-20s utterances).
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--manifest` | - | JSONL manifest **(required)** |
+| `--data_root` | - | Root for wav paths **(required)** |
+| `--output_dir` | - | Output directory for .pt files **(required)** |
+| `--ckpt_dir` | ./ckpts/turbo | Pretrained Turbo weights |
+| `--device` | cuda | GPU device |
+| `--batch_size` | 32 | GPU batch size for S3 tokenizer / VoiceEncoder |
+| `--num_workers` | 8 | Threads for audio loading |
+
+---
+
+### 5.4 `dataset.py` — PyTorch Dataset + Collation
+
+Loads preprocessed `.pt` files for training. Used by `train_pause.py`.
+
+```python
+from dataset import ChatterboxT3Dataset, collate_fn
+
+dataset = ChatterboxT3Dataset(
+    "dataset/preprocessed/train",
+    max_speech_len=1024,   # truncate long utterances
+    max_text_len=256,
+)
+loader = DataLoader(dataset, batch_size=4, collate_fn=collate_fn, shuffle=True)
+```
+
+**Padding:**
+- Text: padded with GPT-2 pad token (50256)
+- Speech: padded with 0
+- Speaker embeddings + conditioning tokens: stacked (fixed-size)
+
+**Batch dict keys:** `text_tokens`, `text_token_lens`, `speech_tokens`, `speech_token_lens`, `speaker_emb`, `cond_tokens`
+
+---
+
+### 5.5 `train_pause.py` — LoRA Training Loop
+
+Fine-tunes T3 with LoRA adapters on GPT-2 attention layers.
 
 ```bash
 python scripts/train_pause.py \
@@ -294,120 +309,216 @@ python scripts/train_pause.py \
     --epochs 10 \
     --batch_size 4 \
     --grad_accum 4 \
-    --lr 2e-4 \
-    --lora_r 16 \
-    --lora_alpha 32 \
-    --wandb  # optional
+    --lr 2e-4
 ```
 
-See `scripts/train_pause.py`. Key design decisions (informed by community projects):
-- Uses T3's **native `loss()` method** for correct concat/splice logic
-- LoRA targets `c_attn` and `c_proj` (GPT-2 attention layers)
-- Sets `cond_prompt_speech_emb=None` so T3 computes it internally
-- `emotion_adv=0.5` (Turbo default, no perceiver/CFG)
-- bf16 autocast, gradient clipping, cosine LR schedule
-- Saves best checkpoint by validation speech loss
+**Effective batch size:** `batch_size * grad_accum` = 16
 
-### 5.4 Inference
+**Training details:**
+- LoRA on `c_attn` + `c_proj`: r=16, alpha=32, dropout=0.05
+- Optimizer: AdamW (lr=2e-4, weight_decay=0.01)
+- Scheduler: Cosine annealing over total optimizer steps
+- Mixed precision: bf16 via `torch.amp`
+- Gradient clipping: max_norm=1.0
+- Auto 5% val split if no `--val_dir` provided
+- Best model saved by lowest val speech loss
+- W&B logging with `--wandb` flag
+
+**Output:**
+- `output/pause_lora/best/` — best checkpoint (by val speech loss)
+- `output/pause_lora/epoch_N/` — per-epoch checkpoints
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--train_dir` | - | Preprocessed .pt directory **(required)** |
+| `--val_dir` | None | Separate val set (auto-split 5% if omitted) |
+| `--ckpt_dir` | ./ckpts/turbo | Pretrained Turbo weights |
+| `--output_dir` | ./output/pause_lora | LoRA checkpoint output |
+| `--epochs` | 10 | Training epochs |
+| `--batch_size` | 4 | Per-device batch size |
+| `--grad_accum` | 4 | Gradient accumulation steps |
+| `--lr` | 2e-4 | Learning rate |
+| `--max_speech_len` | 1024 | Max speech tokens per sample |
+| `--max_text_len` | 256 | Max text tokens per sample |
+| `--lora_r` | 16 | LoRA rank |
+| `--lora_alpha` | 32 | LoRA alpha |
+| `--lora_dropout` | 0.05 | LoRA dropout |
+| `--val_split` | 0.05 | Auto val split ratio |
+| `--log_every` | 10 | Log every N steps |
+| `--save_every_epoch` | 1 | Save checkpoint every N epochs |
+| `--wandb` | false | Enable W&B logging |
+| `--wandb_project` | chatterbox-pause-tags | W&B project name |
+| `--seed` | 42 | Random seed |
+
+---
+
+### 5.6 `inference_pause.py` — Generate Speech with Pauses
 
 ```bash
 python scripts/inference_pause.py \
-    --text "Hello [0.5s] world!" \
+    --text "Hello [0.5s] world! [1.0s] This has pauses." \
     --ref_audio ref.wav \
     --lora_path ./output/pause_lora/best \
     --output out.wav
 ```
 
-See `scripts/inference_pause.py`. Also includes `enforce_pause_durations()` for
-exact-duration post-processing (hybrid approach).
+**How it works:**
+1. Loads Chatterbox Turbo base model
+2. Loads LoRA adapter and merges into base weights (faster inference)
+3. Generates speech — model produces silence token (4299) runs at `[Xs]` positions
+4. Saves 24kHz WAV
 
-### Dataset and Collation
+**Optional duration enforcement:**
+```bash
+python scripts/inference_pause.py \
+    --text "Hello [0.5s] world!" \
+    --ref_audio ref.wav \
+    --lora_path ./output/pause_lora/best \
+    --output out.wav \
+    --enforce_durations
+```
 
-See `scripts/dataset.py` for the `ChatterboxT3Dataset` class and `collate_fn`.
-Pads text with GPT-2's pad token (50256), speech with 0.
+The `--enforce_durations` flag post-processes speech tokens to snap silence runs to the
+exact durations from tags (model learns *where*, post-processing enforces *how long*).
 
----
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--text` | - | Input text with `[Xs]` tags **(required)** |
+| `--ref_audio` | - | Reference audio for voice cloning **(required)** |
+| `--lora_path` | - | LoRA adapter directory **(required)** |
+| `--output` | output.wav | Output WAV path |
+| `--device` | cuda | GPU device |
+| `--enforce_durations` | false | Snap silences to exact tag durations |
+| `--temperature` | 0.8 | Sampling temperature |
+| `--top_k` | 1000 | Top-k sampling |
+| `--top_p` | 0.95 | Nucleus sampling |
 
-## 7. Inference with Fine-Tuned Model
-
+**Programmatic usage:**
 ```python
 from peft import PeftModel
 from chatterbox.tts_turbo import ChatterboxTurboTTS
 
-# Load base model
 model = ChatterboxTurboTTS.from_pretrained(device="cuda")
+model.t3 = PeftModel.from_pretrained(model.t3, "./output/pause_lora/best")
+model.t3.merge_and_unload()
 
-# Wrap T3 with LoRA adapter
-model.t3 = PeftModel.from_pretrained(model.t3, "./output/pause_lora/epoch_9")
-model.t3.merge_and_unload()  # Optional: merge LoRA into base for faster inference
-
-# Generate with pause tag
 wav = model.generate("Hello [0.5s] world!", audio_prompt_path="ref.wav")
 ```
 
 ---
 
-## 8. What Can Go Wrong & Mitigations
+## 6. File Structure
+
+```
+scripts/
+├── download_peoples_speech.py  # Step 1: Download dataset from HuggingFace
+├── make_pause_data.py          # Step 2: Force-align + insert pause tags
+├── preprocess.py               # Step 3: Tokenize audio → .pt (batched GPU)
+├── dataset.py                  # PyTorch Dataset + collate_fn
+├── train_pause.py              # Step 4: LoRA training loop
+├── inference_pause.py          # Step 5: Generate speech with pauses
+└── requirements-train.txt      # pip dependencies
+
+dataset/
+├── wavs/                       # Raw audio files (WAV)
+├── manifests/
+│   ├── train_raw.jsonl         # From download (no pause tags)
+│   └── train.jsonl             # From make_pause_data (with [Xs] tags)
+└── preprocessed/
+    └── train/                  # .pt files from preprocess.py (~43KB each)
+
+ckpts/
+└── turbo/                      # Pretrained Turbo weights
+    ├── t3_turbo_v1.safetensors
+    ├── s3gen_meanflow.safetensors
+    ├── ve.safetensors
+    ├── t3_turbo_v1.yaml
+    ├── tokenizer.json
+    └── tokenizer_config.json
+
+output/
+└── pause_lora/                 # Training output
+    ├── best/                   # Best LoRA checkpoint
+    └── epoch_N/                # Per-epoch checkpoints
+```
+
+---
+
+## 7. Troubleshooting
 
 | Problem | Cause | Fix |
 |---------|-------|-----|
-| Pauses too short/long | Not enough training data with varied durations | Augment with 0.1s-3.0s range |
-| Forgets normal speech | Trained only on pause samples | Mix 50% normal samples without tags |
-| Garbage audio after pause | S3Gen confused by silence runs | Keep pauses <= 3s; add natural silence transitions |
-| LoRA doesn't converge | Rank too low or LR wrong | Try r=32, or lower LR to 1e-4 |
-| OOM on 32GB | Sequences too long | Reduce max_speech_tokens, use gradient checkpointing |
+| Pauses too short/long | Not enough varied training data | Augment with `--augment` flag, range 0.25-3.0s |
+| Forgets normal speech | Only trained on pause samples | `--include_plain` adds tag-free copies (default: on) |
+| Garbage audio after pause | Silence runs too long for S3Gen | Cap pauses at 3.0s in training data |
+| LoRA doesn't converge | Rank too low or LR wrong | Try r=32 or lower LR to 1e-4 |
+| OOM during training | Sequences too long | Reduce `--max_speech_len` or `--batch_size` |
+| `torch.load` errors (pyannote) | PyTorch 2.6+ `weights_only=True` default | `make_pause_data.py` has built-in monkeypatch |
+| WhisperX language detection slow | Auto-detecting per sample | Fixed: hardcoded `language="en"` |
+| Preprocessing fills disk | N/A (fixed) | Batched GPU preprocessing outputs ~43KB/sample, not raw audio |
 
 ---
 
-## 9. Key Differences from LM Training (Things to Know)
+## 8. Tips from LM Fine-Tuning
 
 If you're coming from text LLM fine-tuning:
 
-1. **Token rate matters physically.** In LMs, token count is abstract. Here, 25 tokens =
-   1 second of audio. Silence token 4299 repeated 25 times = exactly 1 second of silence.
-
-2. **Two loss terms.** T3 has both `loss_text` (auxiliary, predicts text tokens) and
-   `loss_speech` (primary, predicts audio tokens). Weight speech loss much higher (~10:1).
-
-3. **Conditioning is critical.** Every sample needs a reference audio clip for speaker
-   identity. Bad conditioning = bad speaker consistency.
-
-4. **You must listen, not just watch loss.** Generate samples every N steps and check if
-   pauses sound right. Loss alone does not tell you about perceptual quality.
-
-5. **The S3Gen/vocoder is frozen.** You only train T3. Speech tokens to audio is
-   deterministic given the same tokens, so if T3 outputs the right silence tokens, the
-   audio will be correct.
+1. **Token rate is physical.** 25 tokens = 1 second of audio. Silence token 4299 repeated 25x = exactly 1s silence.
+2. **Two loss terms.** `loss_speech` (primary) + `0.1 * loss_text` (auxiliary). Speech loss is what matters.
+3. **Conditioning is critical.** Every sample needs reference audio for speaker identity. Bad ref = bad consistency.
+4. **Listen, don't just watch loss.** Generate samples every few epochs. Loss alone doesn't measure perceptual quality.
+5. **S3Gen/vocoder is frozen.** You only train T3. Token-to-audio is deterministic.
 
 ---
 
-## 10. Quick-Start Checklist
+## 9. Quick Start (Copy-Paste)
 
-```
-[ ] 1. Install chatterbox + training deps (Section 3.2)
-[ ] 2. Download pretrained weights (Section 3.4)
-[ ] 3. Prepare aligned dataset with pause tags (Section 4)
-[ ] 4. Verify tokenizer handles your pause tags:
-       tokenizer = AutoTokenizer.from_pretrained("./ckpts/turbo")
-       print(tokenizer("[0.5s]"))  # should produce valid token IDs
-[ ] 5. Write collate_fn (Section 6)
-[ ] 6. Run training (Section 5.2)
-[ ] 7. Listen to samples every few epochs
-[ ] 8. Load LoRA adapter and test (Section 7)
+```bash
+source venv/bin/activate
+
+# 1. Download 30k samples (~13 GB, ~30 min)
+python scripts/download_peoples_speech.py --n_samples 30000 --output_dir dataset
+
+# 2. Generate pause-tagged data (~9 min with 8 workers)
+python scripts/make_pause_data.py \
+    --input_manifest dataset/manifests/train_raw.jsonl \
+    --data_root dataset/ --format jsonl \
+    --output_manifest dataset/manifests/train.jsonl \
+    --output_wavs dataset/wavs --augment --workers 8
+
+# 3. Preprocess / tokenize (~10 min)
+python scripts/preprocess.py \
+    --manifest dataset/manifests/train.jsonl \
+    --data_root dataset/ \
+    --output_dir dataset/preprocessed/train \
+    --batch_size 32 --num_workers 8
+
+# 4. Train LoRA
+python scripts/train_pause.py \
+    --train_dir dataset/preprocessed/train \
+    --output_dir ./output/pause_lora \
+    --epochs 10 --batch_size 4 --grad_accum 4
+
+# 5. Inference
+python scripts/inference_pause.py \
+    --text "Hello [0.5s] world!" \
+    --ref_audio dataset/wavs/ps_000000.wav \
+    --lora_path ./output/pause_lora/best \
+    --output out.wav
 ```
 
 ---
 
-## Appendix: File Reference
+## Appendix: Source Code Reference
 
 | File | Purpose |
 |------|---------|
-| `src/chatterbox/models/t3/t3.py` | T3 model with `loss()` and `inference_turbo()` |
-| `src/chatterbox/models/t3/modules/t3_config.py` | All T3 hyperparameters |
-| `src/chatterbox/models/t3/modules/cond_enc.py` | Conditioning encoder (T3Cond) |
+| `src/chatterbox/models/t3/t3.py` | T3 model: `loss()`, `inference_turbo()` |
+| `src/chatterbox/models/t3/modules/t3_config.py` | T3 hyperparameters |
+| `src/chatterbox/models/t3/modules/cond_enc.py` | Conditioning encoder (T3Cond dataclass) |
 | `src/chatterbox/models/t3/llama_configs.py` | GPT2_medium / Llama_520M configs |
-| `src/chatterbox/models/s3tokenizer/` | Audio to speech tokens (VQ codec) |
-| `src/chatterbox/models/s3gen/` | Speech tokens to mel to waveform |
+| `src/chatterbox/models/s3tokenizer/` | Audio → speech tokens (VQ codec) |
+| `src/chatterbox/models/s3gen/` | Speech tokens → mel → waveform |
 | `src/chatterbox/models/s3gen/const.py` | `S3GEN_SIL = 4299` (silence token) |
-| `src/chatterbox/models/voice_encoder/` | Speaker embedding extractor |
-| `src/chatterbox/tts_turbo.py` | Full turbo inference pipeline |
+| `src/chatterbox/models/voice_encoder/` | Speaker embedding extractor (256-d) |
+| `src/chatterbox/tts_turbo.py` | Full Turbo inference pipeline |
