@@ -64,7 +64,7 @@ def log_step(epoch, epochs, step, total_steps, speech_loss, text_loss, lr,
         f"  [{C_LR}]lr[/] [{C_DIM}]=[/][{C_LR}]{lr:.6f}[/]"
     )
     if tok_per_sec is not None:
-        parts += f"  [{C_SPEED}]tok/s[/] [{C_DIM}]=[/][{C_SPEED}]{tok_per_sec:.0f}[/]"
+        parts += f"  [{C_SPEED}]tok/s[/] [{C_DIM}]=[/][{C_SPEED}]{tok_per_sec:,.0f}[/]"
     if eta_str is not None:
         parts += f"  [{C_ETA}]ETA[/] [{C_DIM}]=[/][{C_ETA}]{eta_str}[/]"
     console.print(parts, highlight=False)
@@ -288,7 +288,7 @@ def main():
     )
 
     logger.info(f"Train: {len(train_dataset)} samples, Val: {len(val_dataset)} samples")
-    logger.info(f"Effective batch size: {args.batch_size * args.grad_accum}")
+    logger.info(f"Effective batch size: {args.batch_size * args.grad_accum}, lr: {args.lr}")
 
     # ── Model ────────────────────────────────────────────────────────────
     logger.info("Loading T3 Turbo...")
@@ -362,7 +362,7 @@ def main():
                 remaining = (total_train_steps - done_steps) / steps_per_sec
                 h, m = divmod(int(remaining), 3600)
                 m, s = divmod(m, 60)
-                eta_str = f"{h}h{m:02d}m" if h else f"{m}m{s:02d}s"
+                eta_str = f"{h}h {m:02d}m" if h else f"{m}m {s:02d}s"
                 # Reset per-window counters
                 log_t0 = now
                 log_tokens = 0
