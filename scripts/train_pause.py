@@ -18,7 +18,9 @@ Requires: pip install peft accelerate wandb (wandb optional)
 
 import argparse
 import logging
+import shutil
 import time
+from collections import deque
 from pathlib import Path
 
 import torch
@@ -91,6 +93,47 @@ def log_best(val_loss, path):
         f"  [{C_DIM}]->[/] [{C_SAVE}]{path}[/]",
         highlight=False,
     )
+
+
+def save_checkpoint(path, t3_lora, optimizer, scheduler, scaler, epoch, global_step, best_val_loss):
+    """Save full training state for resumption."""
+    path = Path(path)
+    # LoRA weights
+    t3_lora.save_pretrained(path)
+    # Training state
+    torch.save({
+        "epoch": epoch,
+        "global_step": global_step,
+        "best_val_loss": best_val_loss,
+        "optimizer": optimizer.state_dict(),
+        "scheduler": scheduler.state_dict(),
+        "scaler": scaler.state_dict(),
+        "rng_cpu": torch.random.get_rng_state(),
+        "rng_cuda": torch.cuda.get_rng_state(),
+    }, path / "train_state.pt")
+
+
+def load_checkpoint(path, t3_lora, optimizer, scheduler, scaler):
+    """Restore full training state from checkpoint."""
+    path = Path(path)
+    # LoRA weights
+    from peft import set_peft_model_state_dict
+    from safetensors.torch import load_file as load_safetensors
+    adapter_path = path / "adapter_model.safetensors"
+    if adapter_path.exists():
+        state = load_safetensors(str(adapter_path))
+        set_peft_model_state_dict(t3_lora, state)
+    # Training state
+    state_path = path / "train_state.pt"
+    if not state_path.exists():
+        raise FileNotFoundError(f"No train_state.pt in {path}")
+    ckpt = torch.load(state_path, weights_only=False)
+    optimizer.load_state_dict(ckpt["optimizer"])
+    scheduler.load_state_dict(ckpt["scheduler"])
+    scaler.load_state_dict(ckpt["scaler"])
+    torch.random.set_rng_state(ckpt["rng_cpu"])
+    torch.cuda.set_rng_state(ckpt["rng_cuda"])
+    return ckpt["epoch"], ckpt["global_step"], ckpt["best_val_loss"]
 
 
 def build_t3_turbo(ckpt_dir: str, device: str) -> T3:
@@ -190,27 +233,28 @@ def compute_loss(t3_model, batch: dict, device: str):
 
     # Speech loss is the primary objective; text loss is auxiliary
     total_loss = loss_speech + 0.1 * loss_text
-    return total_loss, loss_speech.item(), loss_text.item()
+    return total_loss, loss_speech.detach(), loss_text.detach()
 
 
 @torch.no_grad()
 def validate(t3_model, val_loader, device):
     """Run validation and return average losses."""
     t3_model.eval()
-    total_speech_loss = 0.0
-    total_text_loss = 0.0
+    sum_speech = torch.zeros(1, device=device)
+    sum_text = torch.zeros(1, device=device)
     n_batches = 0
 
     for batch in val_loader:
         _, speech_loss, text_loss = compute_loss(t3_model, batch, device)
-        total_speech_loss += speech_loss
-        total_text_loss += text_loss
+        sum_speech += speech_loss
+        sum_text += text_loss
         n_batches += 1
 
     t3_model.train()
     if n_batches == 0:
         return 0.0, 0.0
-    return total_speech_loss / n_batches, total_text_loss / n_batches
+    # Single GPU sync at the end
+    return (sum_speech / n_batches).item(), (sum_text / n_batches).item()
 
 
 def main():
@@ -242,6 +286,12 @@ def main():
     parser.add_argument("--compile", type=str, default=None, metavar="MODE",
                         choices=["default", "reduce-overhead", "max-autotune", "max-autotune-no-cudagraphs"],
                         help="torch.compile mode (omit to disable)")
+    parser.add_argument("--resume", type=str, default=None, metavar="PATH",
+                        help="Resume from checkpoint dir (e.g. ./output/pause_lora/epoch_3)")
+    parser.add_argument("--save_every_steps", type=int, default=0, metavar="N",
+                        help="Save a step checkpoint every N optimizer steps (0 = disabled)")
+    parser.add_argument("--max_checkpoints", type=int, default=3, metavar="K",
+                        help="Max step-checkpoints to keep (FIFO rotation)")
     parser.add_argument("--wandb", action="store_true", help="Enable W&B logging")
     parser.add_argument("--wandb_project", type=str, default="chatterbox-pause-tags")
     args = parser.parse_args()
@@ -280,11 +330,13 @@ def main():
 
     train_loader = DataLoader(
         train_dataset, batch_size=args.batch_size, shuffle=True,
-        collate_fn=collate_fn, num_workers=2, pin_memory=True,
+        collate_fn=collate_fn, num_workers=8, pin_memory=True,
+        persistent_workers=True, prefetch_factor=4,
     )
     val_loader = DataLoader(
         val_dataset, batch_size=args.batch_size, shuffle=False,
-        collate_fn=collate_fn, num_workers=2, pin_memory=True,
+        collate_fn=collate_fn, num_workers=8, pin_memory=True,
+        persistent_workers=True, prefetch_factor=4,
     )
 
     logger.info(f"Train: {len(train_dataset)} samples, Val: {len(val_dataset)} samples")
@@ -311,23 +363,35 @@ def main():
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(total_steps, 1))
     scaler = torch.amp.GradScaler("cuda")
 
-    # ── Training ─────────────────────────────────────────────────────────
-    logger.info("Starting training...")
+    # ── Resume ────────────────────────────────────────────────────────────
+    start_epoch = 0
     global_step = 0
     best_val_loss = float("inf")
+
+    if args.resume:
+        logger.info(f"Resuming from {args.resume}...")
+        start_epoch, global_step, best_val_loss = load_checkpoint(
+            args.resume, t3_lora, optimizer, scheduler, scaler)
+        start_epoch += 1  # resume from NEXT epoch
+        logger.info(f"Resumed: epoch={start_epoch}, global_step={global_step}, "
+                     f"best_val_loss={best_val_loss:.4f}")
+
+    # ── Training ─────────────────────────────────────────────────────────
+    logger.info("Starting training...")
     total_train_steps = len(train_loader) * args.epochs
     train_t0 = time.time()
+    step_ckpt_queue = deque()
 
-    for epoch in range(args.epochs):
+    for epoch in range(start_epoch, args.epochs):
         t3_lora.train()
-        epoch_speech_loss = 0.0
-        epoch_text_loss = 0.0
+        epoch_speech_loss = torch.zeros(1, device=args.device)
+        epoch_text_loss = torch.zeros(1, device=args.device)
         n_steps = 0
         log_t0 = time.time()
-        log_tokens = 0
+        log_tokens = torch.zeros(1, device=args.device)
 
         for step, batch in enumerate(train_loader):
-            batch_tokens = int(batch["speech_token_lens"].sum()) + int(batch["text_token_lens"].sum())
+            batch_tokens = batch["speech_token_lens"].sum() + batch["text_token_lens"].sum()
 
             with torch.amp.autocast("cuda", dtype=torch.bfloat16):
                 total_loss, speech_loss, text_loss = compute_loss(t3_lora, batch, args.device)
@@ -344,6 +408,20 @@ def main():
                 scheduler.step()
                 global_step += 1
 
+                # Step-based checkpointing
+                if args.save_every_steps > 0 and global_step % args.save_every_steps == 0:
+                    step_path = output_dir / f"step_{global_step}"
+                    save_checkpoint(step_path, t3_lora, optimizer, scheduler, scaler,
+                                    epoch, global_step, best_val_loss)
+                    step_ckpt_queue.append(step_path)
+                    log_save(f"Step checkpoint: {step_path}")
+                    # FIFO rotation: remove oldest if over limit
+                    if len(step_ckpt_queue) > args.max_checkpoints:
+                        oldest = step_ckpt_queue.popleft()
+                        if oldest.exists():
+                            shutil.rmtree(oldest)
+                            log_save(f"Removed old checkpoint: {oldest}")
+
             epoch_speech_loss += speech_loss
             epoch_text_loss += text_loss
             n_steps += 1
@@ -351,10 +429,14 @@ def main():
 
             if step % args.log_every == 0:
                 lr = optimizer.param_groups[0]["lr"]
+                # Single GPU sync point: pull losses + tokens for display
+                sp_val = speech_loss.item()
+                tx_val = text_loss.item()
+                tok_count = log_tokens.item()
                 # Throughput
                 now = time.time()
                 dt = now - log_t0
-                tok_per_sec = log_tokens / dt if dt > 0 else 0
+                tok_per_sec = tok_count / dt if dt > 0 else 0
                 # ETA
                 done_steps = epoch * len(train_loader) + step + 1
                 elapsed = now - train_t0
@@ -365,23 +447,23 @@ def main():
                 eta_str = f"{h}h {m:02d}m" if h else f"{m}m {s:02d}s"
                 # Reset per-window counters
                 log_t0 = now
-                log_tokens = 0
+                log_tokens.zero_()
 
                 log_step(epoch + 1, args.epochs, step, len(train_loader),
-                         speech_loss, text_loss, lr, tok_per_sec, eta_str)
+                         sp_val, tx_val, lr, tok_per_sec, eta_str)
                 if args.wandb:
                     wandb.log({
-                        "train/speech_loss": speech_loss,
-                        "train/text_loss": text_loss,
-                        "train/total_loss": total_loss.item(),
+                        "train/speech_loss": sp_val,
+                        "train/text_loss": tx_val,
+                        "train/total_loss": sp_val + 0.1 * tx_val,
                         "train/lr": lr,
                         "train/tok_per_sec": tok_per_sec,
                         "global_step": global_step,
                     })
 
         # ── Epoch summary ────────────────────────────────────────────────
-        avg_speech = epoch_speech_loss / max(n_steps, 1)
-        avg_text = epoch_text_loss / max(n_steps, 1)
+        avg_speech = (epoch_speech_loss / max(n_steps, 1)).item()
+        avg_text = (epoch_text_loss / max(n_steps, 1)).item()
         log_epoch_summary(epoch + 1, "train", avg_speech, avg_text)
 
         # ── Validation ───────────────────────────────────────────────────
@@ -398,13 +480,15 @@ def main():
         # ── Save checkpoint ──────────────────────────────────────────────
         if (epoch + 1) % args.save_every_epoch == 0:
             save_path = output_dir / f"epoch_{epoch+1}"
-            t3_lora.save_pretrained(save_path)
-            log_save(f"Saved LoRA checkpoint: {save_path}")
+            save_checkpoint(save_path, t3_lora, optimizer, scheduler, scaler,
+                            epoch, global_step, best_val_loss)
+            log_save(f"Saved checkpoint: {save_path}")
 
         if val_speech < best_val_loss:
             best_val_loss = val_speech
             best_path = output_dir / "best"
-            t3_lora.save_pretrained(best_path)
+            save_checkpoint(best_path, t3_lora, optimizer, scheduler, scaler,
+                            epoch, global_step, best_val_loss)
             log_best(val_speech, best_path)
 
     console.print(f"  [{C_BEST}]Training complete. Best val speech loss: {best_val_loss:.4f}[/]",

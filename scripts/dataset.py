@@ -24,6 +24,11 @@ class ChatterboxT3Dataset(Dataset):
         self.max_speech_len = max_speech_len
         self.max_text_len = max_text_len
 
+        # Pre-cache single-element tensors (avoids re-creation every __getitem__)
+        self._bot = torch.tensor([BOT_TOKEN], dtype=torch.long)
+        self._eot = torch.tensor([EOT_TOKEN], dtype=torch.long)
+        self._start_speech = torch.tensor([START_SPEECH_TOKEN], dtype=torch.long)
+
         if not self.files:
             raise FileNotFoundError(f"No .pt files found in {preprocessed_dir}")
 
@@ -40,17 +45,10 @@ class ChatterboxT3Dataset(Dataset):
         cond_tokens = data["cond_tokens"]        # (375,)
 
         # Wrap text with BOT (255) and EOT (0) — required by T3._ensure_BOT_EOT
-        text_tokens = torch.cat([
-            torch.tensor([BOT_TOKEN], dtype=torch.long),
-            text_tokens,
-            torch.tensor([EOT_TOKEN], dtype=torch.long),
-        ])
+        text_tokens = torch.cat([self._bot, text_tokens, self._eot])
 
         # Prepend start_speech (6561) — stop_speech (6562) already appended by preprocessing
-        speech_tokens = torch.cat([
-            torch.tensor([START_SPEECH_TOKEN], dtype=torch.long),
-            speech_tokens,
-        ])
+        speech_tokens = torch.cat([self._start_speech, speech_tokens])
 
         return {
             "text_tokens": text_tokens,

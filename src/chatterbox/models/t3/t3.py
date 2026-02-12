@@ -32,6 +32,8 @@ logger = logging.getLogger(__name__)
 
 
 def _ensure_BOT_EOT(text_tokens: Tensor, hp):
+    if not __debug__:
+        return
     B = text_tokens.size(0)
     assert (text_tokens == hp.start_text_token).int().sum() >= B, "missing start_text_token"
     assert (text_tokens == hp.stop_text_token).int().sum() >= B, "missing stop_text_token"
@@ -151,11 +153,11 @@ class T3(nn.Module):
             input_ids=None,
             # position_ids=position_ids, # TODO? ROPE should be fine?
             inputs_embeds=embeds,
-            output_hidden_states=True,
+            output_hidden_states=False,
             return_dict=True,
             use_cache=(not training),
         )
-        hidden_states = tfmr_out.hidden_states[-1]  # final tfmr layer output, (B, seq, dim)
+        hidden_states = tfmr_out.last_hidden_state  # final tfmr layer output, (B, seq, dim)
 
         # post-processing: splice out text and speech parts of hidden states
         len_text = text_tokens.size(1)
